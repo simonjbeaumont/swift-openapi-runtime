@@ -18,6 +18,86 @@ import struct Foundation.URL
 @preconcurrency import struct Foundation.URL
 #endif
 
+public protocol ErrorMapper: Sendable {
+    func makeError(
+        operationID: String,
+        input: any Sendable,
+        request: HTTPRequest?,
+        requestBody: HTTPBody?,
+        baseURL: URL?,
+        response: HTTPResponse?,
+        responseBody: HTTPBody?,
+        error: any Error
+    ) -> any Error
+}
+
+extension ErrorMapper {
+    func _makeError(
+        operationID: String,
+        input: any Sendable,
+        request: HTTPRequest? = nil,
+        requestBody: HTTPBody? = nil,
+        baseURL: URL? = nil,
+        response: HTTPResponse? = nil,
+        responseBody: HTTPBody? = nil,
+        error: any Error
+    ) -> any Error {
+        self.makeError(operationID: operationID, input: input, request: request, requestBody: requestBody, baseURL: baseURL, response: response, responseBody: responseBody, error: error)
+    }
+}
+
+public struct DefaultErrorMapper: ErrorMapper {
+    public func makeError(
+        operationID: String,
+        input: any Sendable,
+        request: HTTPRequest? = nil,
+        requestBody: HTTPBody? = nil,
+        baseURL: URL? = nil,
+        response: HTTPResponse? = nil,
+        responseBody: HTTPBody? = nil,
+        error: any Error
+    ) -> any Error {
+        if var error = error as? ClientError {
+            error.request = error.request ?? request
+            error.requestBody = error.requestBody ?? requestBody
+            error.baseURL = error.baseURL ?? baseURL
+            error.response = error.response ?? response
+            error.responseBody = error.responseBody ?? responseBody
+            return error
+        }
+        let causeDescription: String
+        let underlyingError: any Error
+        if let runtimeError = error as? RuntimeError {
+            causeDescription = runtimeError.prettyDescription
+            underlyingError = runtimeError.underlyingError ?? error
+        } else {
+            causeDescription = "Unknown"
+            underlyingError = error
+        }
+        return ClientError(
+            operationID: operationID,
+            operationInput: input,
+            request: request,
+            requestBody: requestBody,
+            baseURL: baseURL,
+            response: response,
+            responseBody: responseBody,
+            causeDescription: causeDescription,
+            underlyingError: underlyingError
+        )
+    }
+}
+
+struct NoopErrorMapper: ErrorMapper {
+    func makeError(operationID: String, input: any Sendable, request: HTTPTypes.HTTPRequest?, requestBody: HTTPBody?, baseURL: URL?, response: HTTPTypes.HTTPResponse?, responseBody: HTTPBody?, error: any Error) -> any Error {
+        error
+    }
+}
+
+extension ErrorMapper where Self == DefaultErrorMapper {
+    public static var `default`: Self { DefaultErrorMapper() }
+}
+
 /// OpenAPI document-agnostic HTTP client used by OpenAPI document-specific,
 /// generated clients to perform request serialization, middleware and transport
 /// invocation, and response deserialization.
@@ -38,17 +118,21 @@ import struct Foundation.URL
     /// The middlewares to be invoked before the transport.
     public var middlewares: [any ClientMiddleware]
 
+    public var errorMapper: any ErrorMapper
+
     /// Internal initializer that takes an initialized `Converter`.
     internal init(
         serverURL: URL,
         converter: Converter,
         transport: any ClientTransport,
-        middlewares: [any ClientMiddleware]
+        middlewares: [any ClientMiddleware],
+        errorMapper: any ErrorMapper
     ) {
         self.serverURL = serverURL
         self.converter = converter
         self.transport = transport
         self.middlewares = middlewares
+        self.errorMapper = errorMapper
     }
 
     /// Creates a new client.
@@ -56,13 +140,15 @@ import struct Foundation.URL
         serverURL: URL = .defaultOpenAPIServerURL,
         configuration: Configuration = .init(),
         transport: any ClientTransport,
-        middlewares: [any ClientMiddleware] = []
+        middlewares: [any ClientMiddleware] = [],
+        errorMapper: any ErrorMapper = .default
     ) {
         self.init(
             serverURL: serverURL,
             converter: Converter(configuration: configuration),
             transport: transport,
-            middlewares: middlewares
+            middlewares: middlewares,
+            errorMapper: errorMapper
         )
     }
 
@@ -98,54 +184,23 @@ import struct Foundation.URL
             }
         }
         let baseURL = serverURL
-        @Sendable func makeError(
-            request: HTTPRequest? = nil,
-            requestBody: HTTPBody? = nil,
-            baseURL: URL? = nil,
-            response: HTTPResponse? = nil,
-            responseBody: HTTPBody? = nil,
-            error: any Error
-        ) -> any Error {
-            if var error = error as? ClientError {
-                error.request = error.request ?? request
-                error.requestBody = error.requestBody ?? requestBody
-                error.baseURL = error.baseURL ?? baseURL
-                error.response = error.response ?? response
-                error.responseBody = error.responseBody ?? responseBody
-                return error
-            }
-            let causeDescription: String
-            let underlyingError: any Error
-            if let runtimeError = error as? RuntimeError {
-                causeDescription = runtimeError.prettyDescription
-                underlyingError = runtimeError.underlyingError ?? error
-            } else {
-                causeDescription = "Unknown"
-                underlyingError = error
-            }
-            return ClientError(
-                operationID: operationID,
-                operationInput: input,
-                request: request,
-                requestBody: requestBody,
-                baseURL: baseURL,
-                response: response,
-                responseBody: responseBody,
-                causeDescription: causeDescription,
-                underlyingError: underlyingError
-            )
-        }
+
         let (request, requestBody): (HTTPRequest, HTTPBody?) = try await wrappingErrors {
             try serializer(input)
         } mapError: { error in
-            makeError(error: error)
+            errorMapper._makeError(
+                operationID: operationID,
+                input: input,
+                error: error)
         }
         var next: @Sendable (HTTPRequest, HTTPBody?, URL) async throws -> (HTTPResponse, HTTPBody?) = {
             (_request, _body, _url) in
             try await wrappingErrors {
                 try await transport.send(_request, body: _body, baseURL: _url, operationID: operationID)
             } mapError: { error in
-                makeError(
+                errorMapper._makeError(
+                    operationID: operationID,
+                    input: input,
                     request: request,
                     requestBody: requestBody,
                     baseURL: baseURL,
@@ -165,7 +220,9 @@ import struct Foundation.URL
                         next: tmp
                     )
                 } mapError: { error in
-                    makeError(
+                    errorMapper._makeError(
+                        operationID: operationID,
+                        input: input,
                         request: request,
                         requestBody: requestBody,
                         baseURL: baseURL,
@@ -178,7 +235,9 @@ import struct Foundation.URL
         return try await wrappingErrors {
             try await deserializer(response, responseBody)
         } mapError: { error in
-            makeError(
+            errorMapper._makeError(
+                operationID: operationID,
+                input: input,
                 request: request,
                 requestBody: requestBody,
                 baseURL: baseURL,
